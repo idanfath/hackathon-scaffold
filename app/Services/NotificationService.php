@@ -1,0 +1,185 @@
+<?php
+
+namespace App\Services;
+
+use App\Enums\NotificationCategory;
+use App\Enums\NotificationTargetType;
+use App\Events\NotificationReceived;
+use App\Jobs\SendMailJob;
+use App\Models\Notification;
+use App\Models\NotificationRecipient;
+use App\Models\User;
+use Illuminate\Support\Facades\DB;
+
+class NotificationService
+{
+    public function __construct(
+        private MailService $mailService
+    ) {}
+
+    public function send(
+        string $title,
+        NotificationTargetType $targetType,
+        ?int $createdBy,
+        ?string $body = null,
+        ?array $recipientIds = null,
+        ?string $role = null,
+        ?string $action_url = null,
+        ?string $action_label = null,
+        ?bool $sendEmail = false,
+        NotificationCategory $category = NotificationCategory::System,
+    ): void {
+        DB::transaction(function () use (
+            $title,
+            $targetType,
+            $createdBy,
+            $body,
+            $recipientIds,
+            $role,
+            $action_url,
+            $action_label,
+            $sendEmail,
+            $category,
+        ) {
+            $notification = Notification::create([
+                'created_by' => $createdBy,
+                'title' => $title,
+                'body' => $body,
+                'target_type' => $targetType->value,
+                'action_url' => $action_url,
+                'action_label' => $action_label,
+                'category' => $category,
+            ]);
+
+            $query = $this->recipientQuery($targetType, $recipientIds, $role);
+
+            $emailData = $this->mailService::buildEmailData(
+                subject: $notification->title,
+                body: $notification->body,
+                actionUrl: $notification->action_url,
+                actionLabel: $notification->action_label
+            );
+
+            $query->select(['id', 'email'])->chunkById(100, function ($users) use ($notification, $sendEmail, $emailData) {
+                $recipientRows = [];
+                foreach ($users as $user) {
+                    $recipientRows[] = [
+                        'notification_id' => $notification->id,
+                        'user_id' => $user->id,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ];
+
+                    if ($sendEmail) {
+                        SendMailJob::dispatch($user->email, $notification->title, $emailData)->afterCommit();
+                    }
+                }
+
+                NotificationRecipient::insert($recipientRows);
+
+                $recipients = NotificationRecipient::where('notification_id', $notification->id)
+                    ->whereIn('user_id', $users->pluck('id'))
+                    ->get();
+
+                foreach ($recipients as $recipient) {
+                    broadcast(new NotificationReceived($recipient))->toOthers();
+                }
+            });
+        });
+    }
+
+    public function inbox(int $userId, int $perPage = 20, ?string $search = null, ?NotificationCategory $category = null)
+    {
+        $query = Notification::query()
+            ->join('notification_recipients', 'notifications.id', '=', 'notification_recipients.notification_id')
+            ->where('notification_recipients.user_id', $userId);
+
+        if ($search) {
+            $query->where(fn ($q) => $q
+                ->where('notifications.title', 'like', "%{$search}%")
+                ->orWhere('notifications.body', 'like', "%{$search}%"));
+        }
+
+        if ($category) {
+            $query->where(function ($query) use ($category) {
+                $query->where('notifications.category', $category->value);
+
+                if ($category === NotificationCategory::System) {
+                    $query->orWhereNull('notifications.category');
+                }
+            });
+        }
+
+        $notifications = $query
+            ->select([
+                'notifications.*',
+                'notifications.id as id',
+                'notification_recipients.read_at',
+            ])
+            ->orderBy('notifications.created_at', 'desc')
+            ->orderBy('notifications.id', 'desc')
+            ->paginate($perPage)
+            ->withQueryString();
+
+        $notifications->getCollection()->transform(fn ($n) => [
+            'id' => $n->id,
+            'title' => $n->title,
+            'body' => $n->body,
+            'action_url' => $n->action_url,
+            'action_label' => $n->action_label,
+            'category' => ($n->category ?? NotificationCategory::System)->value,
+            'created_at' => $n->created_at,
+            'read_at' => $n->read_at,
+            'sent_at' => $n->created_at,
+        ]);
+
+        return $notifications;
+    }
+
+    public function markRead(int $userId, int $notificationId): void
+    {
+        NotificationRecipient::query()
+            ->forUser($userId)
+            ->forNotification($notificationId)
+            ->unread()
+            ->update(['read_at' => now()]);
+    }
+
+    public function markAllAsRead(int $userId): void
+    {
+        NotificationRecipient::query()
+            ->forUser($userId)
+            ->unread()
+            ->update(['read_at' => now()]);
+    }
+
+    public function delete(int $userId, int $notificationId): void
+    {
+        NotificationRecipient::query()
+            ->forUser($userId)
+            ->forNotification($notificationId)
+            ->delete();
+    }
+
+    public function unreadCount(int $userId): int
+    {
+        return NotificationRecipient::query()
+            ->forUser($userId)
+            ->unread()
+            ->count();
+    }
+
+    private function recipientQuery(
+        NotificationTargetType $targetType,
+        ?array $recipientIds = null,
+        ?string $role = null
+    ) {
+        return match ($targetType) {
+            NotificationTargetType::Everyone => User::query(),
+            NotificationTargetType::Role => User::where('role', $role),
+            NotificationTargetType::Users => User::whereIn('id', $recipientIds ?? []),
+            NotificationTargetType::User => User::where('id', $recipientIds[0] ?? null),
+            default => User::query()->whereRaw('1 = 0'),
+        };
+    }
+}
